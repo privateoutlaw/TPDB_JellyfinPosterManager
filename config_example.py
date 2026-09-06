@@ -19,6 +19,7 @@ class Config:
     TMDB_API_KEY = ""
 
     # Application Settings
+    WEB_HOST = "127.0.0.1"  # Single-user/local by default; do not expose without authentication.
     WEB_PORT = 5001
     MAX_POSTERS_PER_ITEM = 18
     MAX_TPDB_SETS_PER_ITEM = 30
@@ -28,11 +29,11 @@ class Config:
     CACHE_DIR = "cache"
     APP_STATE_DIR = "data"
     TEMP_POSTER_DIR = os.path.join(CACHE_DIR, "temp_posters")
+    # These legacy files are imported into APP_STATE_DIR/poster_manager.sqlite3 once.
+    # Originals are retained; subsequent state updates go to SQLite.
     FAILED_LOG_FILE = os.path.join(LOG_DIR, "failed.log")
     RESULTS_LOG_FILE = os.path.join(LOG_DIR, "results.log")
     PROTECTED_ITEMS_FILE = os.path.join(APP_STATE_DIR, "protected_items.json")
     TPDB_ITEM_MAP_FILE = os.path.join(APP_STATE_DIR, "tpdb_item_map.json")
-    TPDB_SET_CACHE_FILE = os.path.join(CACHE_DIR, "tpdb_set_cache.json")
-    TPDB_PICKER_CACHE_FILE = os.path.join(CACHE_DIR, "tpdb_picker_cache.json")
-    TPDB_SET_CACHE_MAX_AGE_DAYS = 14
+    # Disposable picker-v2/*.json responses do not contain embedded image data.
     TPDB_PICKER_CACHE_MAX_AGE_DAYS = 7

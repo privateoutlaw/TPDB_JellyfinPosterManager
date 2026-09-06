@@ -273,6 +273,14 @@
     </div>
 </div>
 
+<section id="jobQueuePanel" class="card mb-4" aria-labelledby="jobQueueHeading" hidden>
+    <div class="card-body py-3">
+        <h5 id="jobQueueHeading" class="mb-1">Poster jobs</h5>
+        <p class="small text-muted mb-2">Automatic, manual, and retry uploads share one queue. Interrupted jobs wait for your confirmation.</p>
+        <div id="jobQueueList" aria-live="polite"></div>
+    </div>
+</section>
+
 <!-- Grid Tools -->
 <div class="row mb-3">
     <div class="col-12 d-flex flex-wrap justify-content-end gap-2">

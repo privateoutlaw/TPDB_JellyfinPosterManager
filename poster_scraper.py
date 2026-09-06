@@ -19,7 +19,11 @@ import base64
 from datetime import datetime
 import threading
 from urllib.parse import parse_qsl, quote_plus, urlencode, urlsplit, urlunsplit
-from config import Config
+try:
+    from config import Config
+except ModuleNotFoundError:
+    from config_example import Config
+from safe_http import ImageLoginRequired, fetch_image, origin
 import logging
 from requests.exceptions import ChunkedEncodingError, ConnectionError
 
@@ -31,6 +35,15 @@ except ImportError:
 
 if Config.JELLYFIN_URL:
     Config.JELLYFIN_URL = Config.JELLYFIN_URL.rstrip('/')
+
+
+def get_jellyfin_headers(**headers):
+    """Build headers for Jellyfin API-key authentication (including Jellyfin 12+)."""
+    return {
+        'Authorization': f'MediaBrowser Token="{Config.JELLYFIN_API_KEY}"',
+        **headers,
+    }
+
 
 # Global Selenium driver
 selenium_driver = None
@@ -297,34 +310,40 @@ def get_selenium_cookies_as_dict():
         except Exception:
             return {}
 
-def download_image_with_cookies(url, save_path):
-    """
-    Download an image from TPDb using Selenium cookies for authentication.
-    """
-    try:
-        # Ensure target dir exists
-        os.makedirs(os.path.dirname(save_path), exist_ok=True)
+def get_tpdb_cookie_jar():
+    """Keep Selenium's domain/path restrictions; never make hostless cookies."""
+    jar = requests.cookies.RequestsCookieJar()
+    with selenium_lock:
+        cookies = selenium_driver.get_cookies() if selenium_driver else []
+    for cookie in cookies:
+        domain = cookie.get('domain', '')
+        if domain.lstrip('.') != 'theposterdb.com':
+            continue
+        jar.set(cookie['name'], cookie['value'], domain=domain,
+                path=cookie.get('path', '/'), secure=cookie.get('secure', True))
+    return jar
 
-        with requests.Session() as session:
-            session.cookies.update(get_selenium_cookies_as_dict())
-            session.headers.update({
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-                "Referer": "https://theposterdb.com/",
-                "Accept": "image/webp,image/apng,image/*,*/*;q=0.8"
-            })
-            response = session.get(url, stream=True, timeout=30)
-            if response.status_code == 200:
-                with open(save_path, "wb") as f:
-                    for chunk in response.iter_content(8192):
-                        if chunk:
-                            f.write(chunk)
-                logging.debug(f"Saved image to {save_path}")
-                return True
-            else:
-                logging.warning(f"Failed to download image from {url} (status {response.status_code})")
-                return False
+
+def fetch_tpdb_image(url):
+    return fetch_image(url, 'tpdb', cookies=get_tpdb_cookie_jar(), headers={
+        'User-Agent': 'Mozilla/5.0', 'Referer': Config.TPDB_BASE_URL + '/',
+        'Accept': 'image/webp,image/png,image/jpeg,image/avif',
+    })
+
+
+def download_image_with_cookies(url, save_path):
+    try:
+        image_bytes, _ = fetch_tpdb_image(url)
+        os.makedirs(os.path.dirname(save_path) or '.', exist_ok=True)
+        # Upload paths are JPEG, so convert the contents as well as the extension.
+        with Image.open(BytesIO(image_bytes)) as image:
+            image = ImageOps.exif_transpose(image).convert('RGB')
+            image.save(save_path, format='JPEG', quality=95)
+        return True
+    except ImageLoginRequired:
+        raise
     except Exception as e:
-        logging.error(f"Error downloading image from {url}: {e}")
+        logging.error('Error downloading poster: %s', e)
         return False
 
 def get_content_type(file_path):
@@ -353,8 +372,7 @@ def get_local_image_hash(image_path):
 def get_jellyfin_image_hash(item_id, image_type='Primary', index=0):
     try:
         url = f"{Config.JELLYFIN_URL}/Items/{item_id}/Images/{image_type}/{index}"
-        headers = {'X-Emby-Token': Config.JELLYFIN_API_KEY}
-        response = requests.get(url, headers=headers, timeout=10)
+        response = requests.get(url, headers=get_jellyfin_headers(), timeout=10)
         if response.status_code == 404:
             return None
         response.raise_for_status()
@@ -404,31 +422,13 @@ def get_image_as_base64(image_url, max_size=TPDB_PREVIEW_MAX_SIZE, quality=TPDB_
     """
     for attempt in range(2):
         try:
-            with requests.Session() as session:
-                session.cookies.update(get_selenium_cookies_as_dict())
-                session.headers.update({
-                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-                    "Referer": "https://theposterdb.com/",
-                    "Accept": "image/webp,image/apng,image/*,*/*;q=0.8"
-                })
-
-                logging.debug(f"Converting image to base64: {image_url}")
-                response = session.get(image_url, timeout=15)
-                if response.status_code == 429 and attempt == 0:
-                    logging.warning("TPDb preview image rate limit hit; retrying in %ss.", TPDB_IMAGE_PREVIEW_RETRY_DELAY_SEC)
-                    time.sleep(TPDB_IMAGE_PREVIEW_RETRY_DELAY_SEC)
-                    continue
-                response.raise_for_status()
-
-                image_bytes = response.content
-                content_type = response.headers.get('content-type', 'image/jpeg')
-                if max_size:
-                    compressed = _compress_image_preview(image_bytes, max_size=max_size, quality=quality)
-                    if compressed:
-                        content_type, image_bytes = compressed
-
-                image_data = base64.b64encode(image_bytes).decode('utf-8')
-                return f"data:{content_type};base64,{image_data}"
+            image_bytes, content_type = fetch_tpdb_image(image_url)
+            if max_size:
+                compressed = _compress_image_preview(image_bytes, max_size=max_size, quality=quality)
+                if compressed:
+                    content_type, image_bytes = compressed
+            image_data = base64.b64encode(image_bytes).decode('utf-8')
+            return f"data:{content_type};base64,{image_data}"
         except Exception as e:
             logging.warning(f"Error converting image to base64: {e}")
             return None
@@ -496,10 +496,12 @@ def _season_key_from_jellyfin(season):
 def _tpdb_absolute_url(href):
     if not href:
         return None
-    if href.startswith('http'):
-        return href
-    if href.startswith('/'):
-        return Config.TPDB_BASE_URL + href
+    url = Config.TPDB_BASE_URL + href if href.startswith('/') else href
+    try:
+        if origin(url) in {origin(Config.TPDB_BASE_URL), ('https', 'images.theposterdb.com', 443)}:
+            return url
+    except ValueError:
+        pass
     return None
 
 
@@ -579,6 +581,8 @@ def _poster_dict(poster_id, poster_url, base64_image=None, target_type="series",
         'set_url': metadata.get('set_url'),
         'tpdb_poster_id': metadata.get('tpdb_poster_id'),
         'source_url': metadata.get('source_url'),
+        'preview_url': metadata.get('preview_url'),
+        'preview_needs_load': base64_image is None,
     }
     if season:
         poster.update({
@@ -675,6 +679,7 @@ def search_tpdb_for_poster_groups(
     cached_available_sets=None,
     preview_max_size=TPDB_PREVIEW_MAX_SIZE,
     preview_quality=TPDB_PREVIEW_QUALITY,
+    require_exact=False,
 ):
     """Return grouped TPDb poster candidates plus a flat show-poster list."""
     global selenium_driver
@@ -793,6 +798,11 @@ def search_tpdb_for_poster_groups(
                                 search_query,
                             )
 
+                        if require_exact:
+                            if not expected_year or len(exact_matches) != 1:
+                                return {'posters': [], 'groups': [], 'best_group': None,
+                                        'review_needed': True, 'search_query': search_query}
+                            fallback_matches = []
                         queued_candidate_indexes = set()
                         candidates_to_check = []
                         for candidate in exact_matches + fallback_matches:
@@ -1196,37 +1206,34 @@ def upload_image_to_jellyfin_improved(item_id, image_path):
             logging.info(f"Image for item {item_id} is identical to existing.")
             return True
 
-        # Read and encode the image
         with open(image_path, 'rb') as f:
             image_data = f.read()
-        
-        encoded_data = base64.b64encode(image_data)
 
-        # Prepare the upload
         url = f"{Config.JELLYFIN_URL}/Items/{item_id}/Images/Primary/0"
-        headers = {
-            'X-Emby-Token': Config.JELLYFIN_API_KEY,
-            'Content-Type': get_content_type(image_path),
-            'Connection': 'keep-alive'
-        }
+        headers = get_jellyfin_headers(
+            **{
+                'Content-Type': get_content_type(image_path),
+                'Connection': 'keep-alive',
+            }
+        )
 
-        # Send the POST request
+        # Despite declaring a binary body in its OpenAPI document, Jellyfin 12's
+        # ImageController still base64-decodes the request stream.
+        encoded_data = base64.b64encode(image_data)
         response = requests.post(url, headers=headers, data=encoded_data, timeout=30)
 
         if response.status_code in [200, 204]:
             logging.info("Artwork uploaded successfully.")
             return True
-        else:
-            logging.warning(f"Failed to upload artwork: {response.status_code}")
-            return False
+
+        response_detail = (response.text or '').strip()
+        detail_suffix = f": {response_detail[:500]}" if response_detail else ''
+        logging.warning(f"Failed to upload artwork: {response.status_code}{detail_suffix}")
+        return False
 
     except Exception as e:
         logging.error(f"Error during image upload: {e}")
         return False
-    finally:
-        # Clean up memory
-        if 'encoded_data' in locals():
-            del encoded_data
 
 
 def _parse_jellyfin_datetime(value):
@@ -1243,10 +1250,7 @@ def get_jellyfin_seasons(series_id):
     if not Config.JELLYFIN_URL or not Config.JELLYFIN_API_KEY or not series_id:
         return []
 
-    headers = {
-        "X-Emby-Token": Config.JELLYFIN_API_KEY,
-        "Accept": "application/json",
-    }
+    headers = get_jellyfin_headers(Accept="application/json")
     seasons_url = (
         f"{Config.JELLYFIN_URL}/Shows/{series_id}/Seasons"
         "?Fields=Id,Name,IndexNumber,PremiereDate,ImageTags"
@@ -1286,34 +1290,36 @@ def get_jellyfin_seasons(series_id):
             })
         return seasons
     except Exception as e:
-        logging.warning(f"Could not fetch seasons for Jellyfin series {series_id}: {e}")
-        return []
+        raise RuntimeError(f'Could not fetch seasons for Jellyfin series {series_id}') from e
 
 
 def get_jellyfin_server_info():
     try:
         url = f"{Config.JELLYFIN_URL}/System/Info"
-        headers = {"X-Emby-Token": Config.JELLYFIN_API_KEY}
-        response = requests.get(url, headers=headers, timeout=10)
+        response = requests.get(url, headers=get_jellyfin_headers(), timeout=10)
         response.raise_for_status()
         data = response.json()
         return {
             'name': data.get('ServerName', 'Jellyfin Server'),
             'version': data.get('Version', ''),
-            'id': data.get('Id', '')
+            'id': data.get('Id', ''),
+            'connected': True,
         }
     except Exception as e:
         logging.error(f"Error fetching server info: {e}")
-        return {'name': 'Jellyfin Server', 'version': '', 'id': ''}
+        return {'name': 'Jellyfin Server', 'version': '', 'id': '', 'connected': False}
 
 
 def get_jellyfin_libraries():
     if not Config.JELLYFIN_URL or not Config.JELLYFIN_API_KEY:
         return []
 
-    headers = {"X-Emby-Token": Config.JELLYFIN_API_KEY}
     try:
-        response = requests.get(f"{Config.JELLYFIN_URL}/Library/VirtualFolders", headers=headers, timeout=10)
+        response = requests.get(
+            f"{Config.JELLYFIN_URL}/Library/VirtualFolders",
+            headers=get_jellyfin_headers(),
+            timeout=10,
+        )
         response.raise_for_status()
         libraries = []
         for library in response.json():
@@ -1345,10 +1351,7 @@ def get_jellyfin_items(item_type=None, sort_by='name', libraries=None):
         return []
 
     items = []
-    headers = {
-        "X-Emby-Token": Config.JELLYFIN_API_KEY,
-        "Accept": "application/json",
-    }
+    headers = get_jellyfin_headers(Accept="application/json")
     libraries = libraries if libraries is not None else get_jellyfin_libraries()
     library_names = {library['id']: library['name'] for library in libraries}
 
@@ -1386,6 +1389,9 @@ def get_jellyfin_items(item_type=None, sort_by='name', libraries=None):
     sort_by_param = sort_params.get(sort_by, 'SortName')
     sort_order = 'Descending' if sort_by == 'date_added' else 'Ascending'
 
+    def parse_date(date_str):
+        return _parse_jellyfin_datetime(date_str) or datetime.min
+
     try:
         if libraries:
             include_types = "Movie,Series"
@@ -1399,7 +1405,7 @@ def get_jellyfin_items(item_type=None, sort_by='name', libraries=None):
                     f"{Config.JELLYFIN_URL}/Items"
                     f"?ParentId={library['id']}"
                     f"&IncludeItemTypes={include_types}&Recursive=true"
-                    f"&Fields=Id,Name,ProductionYear,Path,ImageTags,ProviderIds,DateCreated,Type,ParentId,AncestorIds,ChildCount"
+                    f"&Fields=Id,Name,ProductionYear,Path,ImageTags,ProviderIds,DateCreated,Type,ParentId,ChildCount"
                 )
                 response = requests.get(library_items_url, headers=headers, timeout=15)
                 response.raise_for_status()
@@ -1413,13 +1419,6 @@ def get_jellyfin_items(item_type=None, sort_by='name', libraries=None):
             elif sort_by == 'year':
                 items.sort(key=lambda x: ((x.get('year') or 0), (x.get('title') or '').lower()))
             elif sort_by == 'date_added':
-                def parse_date(date_str):
-                    if not date_str:
-                        return datetime.min
-                    try:
-                        return datetime.fromisoformat(date_str.replace('Z', '+00:00'))
-                    except Exception:
-                        return datetime.min
                 items.sort(key=lambda x: parse_date(x['date_created']), reverse=True)
             else:
                 items.sort(key=lambda x: (x.get('title') or '').lower())
@@ -1432,7 +1431,7 @@ def get_jellyfin_items(item_type=None, sort_by='name', libraries=None):
             all_items_url = (
                 f"{Config.JELLYFIN_URL}/Items"
                 f"?IncludeItemTypes=Movie,Series&Recursive=true"
-                f"&Fields=Id,Name,ProductionYear,Path,ImageTags,ProviderIds,DateCreated,Type,ParentId,AncestorIds,ChildCount"
+                f"&Fields=Id,Name,ProductionYear,Path,ImageTags,ProviderIds,DateCreated,Type,ParentId,ChildCount"
                 f"&SortBy={sort_by_param}&SortOrder={sort_order}"
             )
             response = requests.get(all_items_url, headers=headers, timeout=15)
@@ -1443,14 +1442,6 @@ def get_jellyfin_items(item_type=None, sort_by='name', libraries=None):
                 for item in all_data['Items']:
                     items.append(build_item(item, "Movie" if item.get('Type') == 'Movie' else "Series"))
             # Python-side sort for safety
-            from datetime import datetime
-            def parse_date(date_str):
-                if not date_str:
-                    return datetime.min
-                try:
-                    return datetime.fromisoformat(date_str.replace('Z', '+00:00'))
-                except Exception:
-                    return datetime.min
             items.sort(key=lambda x: parse_date(x['date_created']), reverse=True)
 
         else:
@@ -1459,7 +1450,7 @@ def get_jellyfin_items(item_type=None, sort_by='name', libraries=None):
                 movies_url = (
                     f"{Config.JELLYFIN_URL}/Items"
                     f"?IncludeItemTypes=Movie&Recursive=true"
-                    f"&Fields=Id,Name,ProductionYear,Path,ImageTags,ProviderIds,DateCreated,ParentId,AncestorIds"
+                    f"&Fields=Id,Name,ProductionYear,Path,ImageTags,ProviderIds,DateCreated,ParentId"
                     f"&SortBy={sort_by_param}&SortOrder={sort_order}"
                 )
                 response = requests.get(movies_url, headers=headers, timeout=15)
@@ -1473,7 +1464,7 @@ def get_jellyfin_items(item_type=None, sort_by='name', libraries=None):
                 shows_url = (
                     f"{Config.JELLYFIN_URL}/Items"
                     f"?IncludeItemTypes=Series&Recursive=true"
-                    f"&Fields=Id,Name,ProductionYear,Path,ImageTags,ProviderIds,DateCreated,ParentId,AncestorIds,ChildCount"
+                    f"&Fields=Id,Name,ProductionYear,Path,ImageTags,ProviderIds,DateCreated,ParentId,ChildCount"
                     f"&SortBy={sort_by_param}&SortOrder={sort_order}"
                 )
                 response = requests.get(shows_url, headers=headers, timeout=15)
@@ -1482,8 +1473,7 @@ def get_jellyfin_items(item_type=None, sort_by='name', libraries=None):
                 for item in shows_data.get('Items', []):
                     items.append(build_item(item, "Series"))
     except Exception as e:
-        logging.error(f"Error fetching items from Jellyfin: {e}")
-        return []
+        raise RuntimeError('Could not load Jellyfin library items') from e
 
     logging.info(f"Total items fetched: {len(items)}")
     return items

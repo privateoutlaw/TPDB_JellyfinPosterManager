@@ -70,7 +70,7 @@ function initAutoBatchSeasonSettings() {
     const savedIncludeSeasonPosters = localStorage.getItem('jpm_include_season_posters');
     const savedReplaceSeasonPosters = localStorage.getItem('jpm_replace_season_posters');
     includeInput.checked = savedIncludeSeasonPosters === 'true';
-    replaceInput.checked = savedReplaceSeasonPosters === null ? true : savedReplaceSeasonPosters === 'true';
+    replaceInput.checked = savedReplaceSeasonPosters === 'true';
 
     const syncReplaceState = () => {
         replaceInput.disabled = !includeInput.checked;
@@ -204,6 +204,7 @@ document.addEventListener('DOMContentLoaded', function() {
     // Initialize counters/buttons
     updateUploadAllButton();
     initManualQueueControls();
+    restoreSelections().catch(error => showAlert(error.message, 'danger'));
     initProtectedItemButtons();
     loadProtectedItems();
     loadFailedItems();
@@ -650,6 +651,7 @@ function preparePosterSearchForItem(itemId, setLimit = 3) {
         resetPosterSearchState();
     }
     currentItemId = itemId;
+    currentPosterSelection = selectedPosters[itemId] || currentPosterSelection;
     currentPosterSetLimit = setLimit;
 }
 
@@ -707,6 +709,7 @@ function displayPosters(item, posters, posterGroups = [], eligibleSeasons = [], 
     posterSearchGroups = Array.isArray(posterGroups) ? posterGroups : [];
     if (previousItemId !== item.id) {
         resetPosterSearchState();
+        currentPosterSelection = selectedPosters[item.id] || null;
     }
     currentPosterSearchItem = item;
     currentPosterEligibleSeasons = Array.isArray(eligibleSeasons) ? eligibleSeasons : [];
@@ -786,7 +789,7 @@ function renderPosterImageFrame(poster, altText) {
     const needsLoad = Boolean(poster.preview_needs_load && poster.url);
     const imageClasses = ['card-img-top', 'poster-image'];
     if (needsLoad) imageClasses.push('poster-image-placeholder');
-    const fullPreviewUrl = needsLoad ? `/thumbnail?url=${encodeURIComponent(poster.url)}` : '';
+    const fullPreviewUrl = needsLoad ? `/thumbnail?url=${encodeURIComponent(poster.preview_url || poster.url)}` : '';
 
     return `
         <div class="poster-container ${needsLoad ? 'poster-preview-loading' : ''}">
@@ -805,12 +808,12 @@ function renderPosterImageFrame(poster, altText) {
                     </div>
                 </div>
             ` : ''}
-            <img src="${hasImage ? poster.base64 : ''}"
+            <img src="${hasImage ? poster.base64 : needsLoad ? '/static/images/no-poster.svg' : ''}"
                 class="${imageClasses.join(' ')}"
                 alt="${escapeHtml(altText)}"
                 loading="lazy"
                 ${fullPreviewUrl ? `data-full-src="${escapeHtml(fullPreviewUrl)}"` : ''}
-                style="${!hasImage ? 'display: none;' : ''}">
+                style="${!hasImage && !needsLoad ? 'display: none;' : ''}">
         </div>
     `;
 }
@@ -821,6 +824,7 @@ function loadPosterPreviewImage(image) {
 
     image.removeAttribute('data-full-src');
     image.addEventListener('load', () => {
+        image.style.display = '';
         image.classList.remove('poster-image-placeholder');
         image.classList.remove('poster-set-browser-preview-placeholder');
         image.closest('.poster-container')?.classList.remove('poster-preview-loading');
@@ -1162,9 +1166,9 @@ function renderUnloadedPosterSets(group, loadedSetIds = [], inlineLoadedSetIds =
                     return `
                         <div class="poster-set-browser-row d-flex flex-wrap justify-content-between align-items-center gap-2">
                             <div class="poster-set-browser-info d-flex align-items-center gap-3">
-                                ${previewBase64 ? `
+                                ${previewBase64 || fullPreviewUrl ? `
                                     <img class="poster-set-browser-preview ${fullPreviewUrl ? 'poster-set-browser-preview-placeholder' : ''}"
-                                        src="${previewBase64}"
+                                        src="${previewBase64 || '/static/images/no-poster.svg'}"
                                         ${fullPreviewUrl ? `data-full-src="${escapeHtml(fullPreviewUrl)}"` : ''}
                                         alt="${escapeHtml(setInfo.uploader || 'TPDb set')} preview"
                                         loading="lazy">
@@ -1535,6 +1539,7 @@ async function saveCurrentPosterSelection(options = {}) {
     if (!data.success) throw new Error(data.error || 'Failed to select poster');
 
     selectedPosters[currentItemId] = currentPosterSelection;
+    setManualQueueItemQueued(currentItemId, false);
     if (options.fromQueue) {
         manualQueueSelectionIds.add(currentItemId);
     } else {
@@ -1781,25 +1786,11 @@ function updateItemStatus(itemId, status) {
 
 // Upload individual selected poster
 async function uploadPoster(itemId) {
-    updateItemStatus(itemId, 'uploading');
-
     try {
-        const response = await fetch(`/upload/${itemId}`, { method: 'POST' });
-        const data = await response.json();
-
-        if (data.success) {
-            updateItemStatus(itemId, 'uploaded');
-            showAlert('Poster uploaded successfully!', 'success');
-            // Optional: reload to refresh thumbnails
-            setTimeout(() => window.location.reload(), 800);
-        } else {
-            updateItemStatus(itemId, 'error');
-            showAlert('Upload failed: ' + (data.error || 'Unknown error'), 'danger');
-        }
+        const confirmed = await confirmProtectedUploads([itemId]);
+        await enqueuePosterJob({ kind: 'manual', item_ids: [itemId], confirm_protected: confirmed });
     } catch (error) {
-        console.error('Error uploading poster:', error);
-        updateItemStatus(itemId, 'error');
-        showAlert('Upload failed: ' + error.message, 'danger');
+        showAlert(error.message, 'danger');
     }
 }
 
@@ -1819,62 +1810,12 @@ async function uploadAllSelected() {
     });
     if (!confirmed) return;
 
-    const progressContainer = document.getElementById('progressContainer');
-    const progressBar = document.getElementById('progressBar');
-    const progressText = document.getElementById('progressText');
-
-    if (progressContainer) progressContainer.style.display = 'block';
-    if (progressBar) progressBar.style.width = '20%';
-    if (progressText) progressText.textContent = 'Starting...';
-
-    const uploadBtn = document.getElementById('uploadAllBtn');
-    if (uploadBtn) {
-        uploadBtn.disabled = true;
-        uploadBtn.classList.add('is-expanded');
-        uploadBtn.innerHTML = '<i class="fas fa-spinner fa-spin me-2"></i>Uploading...';
-    }
-    Object.keys(selectedPosters).forEach(itemId => updateItemStatus(itemId, 'uploading'));
-
     try {
-        const response = await fetch('/upload-all', { method: 'POST' });
-        const data = await response.json();
-
-        if (progressBar) progressBar.style.width = '80%';
-        if (!data.results) throw new Error(data.error || 'Batch upload failed');
-
-        // Reflect results in UI
-        data.results.forEach(result => {
-            if (result.success) {
-                updateItemStatus(result.item_id, 'uploaded');
-            } else {
-                updateItemStatus(result.item_id, 'error');
-            }
-        });
-
-        if (progressBar) progressBar.style.width = '100%';
-        if (progressText) progressText.textContent = '100%';
-
-        showBatchResults(data.results);
-        loadFailedItems({ autoExpand: true });
-        loadProcessedItems();
-
-        // Refresh after short delay to update any thumbnails
-        setTimeout(() => {
-            if (progressContainer) progressContainer.style.display = 'none';
-            window.location.reload();
-        }, 1500);
-
+        const ids = Object.keys(selectedPosters);
+        const confirmProtected = await confirmProtectedUploads(ids);
+        await enqueuePosterJob({ kind: 'manual', item_ids: ids, confirm_protected: confirmProtected });
     } catch (error) {
-        console.error('Error in batch upload:', error);
-        showAlert('Batch upload failed: ' + error.message, 'danger');
-        if (progressContainer) progressContainer.style.display = 'none';
-    } finally {
-        if (uploadBtn) {
-            uploadBtn.disabled = false;
-            uploadBtn.classList.remove('is-expanded');
-            uploadBtn.innerHTML = '<i class="fas fa-cloud-upload-alt me-2"></i>Upload All Selected';
-        }
-        updateUploadAllButton();
+        showAlert(error.message, 'danger');
     }
 }
 
@@ -1902,7 +1843,7 @@ function showBatchResults(results) {
                     <div class="card-body text-center">
                         <i class="fas fa-exclamation-circle fa-2x text-danger mb-2"></i>
                         <h4 class="text-danger">${failCount}</h4>
-                        <small class="text-muted">Failed</small>
+                        <small class="text-muted">Partial, failed, or skipped</small>
                     </div>
                 </div>
             </div>
@@ -1914,7 +1855,7 @@ function showBatchResults(results) {
                     All (${results.length})
                 </button>
                 <button class="btn btn-outline-danger batch-results-filter" type="button" data-filter="failed">
-                    Failed (${failCount})
+                    Other (${failCount})
                 </button>
                 <button class="btn btn-outline-success batch-results-filter" type="button" data-filter="successful">
                     Successful (${successCount})
@@ -2013,7 +1954,7 @@ function renderBatchResults(results, filter) {
             <td>
                 ${result.success ?
                     '<span class="badge bg-success">Success</span>' :
-                    '<span class="badge bg-danger">Failed</span>'
+                    `<span class="badge bg-${result.status === 'skipped' || result.status === 'partial' ? 'warning text-dark' : 'danger'}">${escapeHtml(result.status || 'Failed')}</span>`
                 }
             </td>
             <td>${escapeHtml(result.error || '-')}</td>
@@ -2117,12 +2058,17 @@ async function toggleManualQueueItem(checkbox) {
         checkbox.checked = true;
     }
 
-    if (checkbox.checked) {
-        manualQueueIds.add(itemId);
-        wrapper?.classList.add('manual-queued');
-    } else {
-        manualQueueIds.delete(itemId);
-        wrapper?.classList.remove('manual-queued');
+    try {
+        const response = await fetch(`/queue/${encodeURIComponent(itemId)}`, {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ queued: checkbox.checked })
+        });
+        const data = await response.json();
+        if (!response.ok) throw new Error(data.error || 'Could not save queue');
+        setManualQueueItemQueued(itemId, checkbox.checked);
+    } catch (error) {
+        checkbox.checked = manualQueueIds.has(itemId);
+        showAlert(error.message, 'danger');
     }
 
     updateUploadAllButton();
@@ -2206,7 +2152,6 @@ function showNextManualQueueResult() {
 
         if (manualQueueErrors.has(itemId)) {
             manualQueuePresentedIds.add(itemId);
-            setManualQueueItemQueued(itemId, false);
             continue;
         }
 
@@ -2214,7 +2159,6 @@ function showNextManualQueueResult() {
         if (!data) break;
 
         manualQueueCurrentItemId = itemId;
-        setManualQueueItemQueued(itemId, false);
         preparePosterSearchForItem(itemId, data.poster_set_limit || 3);
         applyPosterSearchData(data, data.poster_set_limit || 3);
         updateUploadAllButton();
@@ -2410,8 +2354,9 @@ async function loadFailedItems(options = {}) {
                         <button class="btn btn-outline-warning btn-sm retry-failed-item-btn"
                                 type="button"
                                 data-item-id="${escapeHtml(item.item_id || '')}"
+                                data-needs-review="${Boolean(item.needs_review)}"
                                 ${canRetry ? '' : 'disabled'}>
-                            <i class="fas fa-rotate-right me-1"></i>Retry
+                            <i class="fas fa-${item.needs_review ? 'images' : 'rotate-right'} me-1"></i>${item.needs_review ? 'Review' : 'Retry failed targets'}
                         </button>
                     </td>
                 </tr>
@@ -2419,7 +2364,9 @@ async function loadFailedItems(options = {}) {
         }).join('');
 
         document.querySelectorAll('.retry-failed-item-btn').forEach(button => {
-            button.addEventListener('click', () => retryFailedItem(button.getAttribute('data-item-id'), button));
+            button.addEventListener('click', () => button.dataset.needsReview === 'true'
+                ? loadPosters(button.dataset.itemId)
+                : retryFailedItem(button.dataset.itemId, button));
         });
         document.querySelectorAll('.failed-item-link').forEach(button => {
             button.addEventListener('click', () => scrollToItemCard(button.getAttribute('data-item-id')));
@@ -2806,17 +2753,7 @@ async function retryFailedItem(itemId, button) {
     }
 
     try {
-        const response = await fetch('/failed-items/retry', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ item_id: itemId })
-        });
-        const data = await response.json();
-        if (!response.ok || !data.success) throw new Error(data.error || 'Retry failed');
-
-        showAlert(`Poster retry succeeded for ${data.item_title || itemId}`, 'success');
-        loadFailedItems();
-        loadProcessedItems();
+        await enqueuePosterJob({ kind: 'retry', item_ids: [itemId] });
     } catch (error) {
         console.error('Retry failed item error:', error);
         showAlert('Retry failed: ' + error.message, 'danger');
@@ -2831,7 +2768,7 @@ async function retryAllFailedItems() {
     const retryAllBtn = document.getElementById('retryAllFailedBtn');
     const confirmed = await showConfirmDialog({
         title: 'Retry failed items?',
-        message: 'Retry poster fetch and upload for all recent failed items?',
+        message: 'Retry failed uploads using their original posters? Protected items are skipped; uncertain matches remain for manual review.',
         confirmText: 'Retry all',
         variant: 'warning'
     });
@@ -2843,17 +2780,7 @@ async function retryAllFailedItems() {
     }
 
     try {
-        const response = await fetch('/failed-items/retry-all', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ limit: 100 })
-        });
-        const data = await response.json();
-        if (!response.ok) throw new Error(data.error || 'Retry all failed');
-
-        showBatchResults(data.results || []);
-        loadFailedItems({ autoExpand: true });
-        loadProcessedItems();
+        await enqueuePosterJob({ kind: 'retry', item_ids: Array.from(activeFailedItemIds) });
     } catch (error) {
         console.error('Retry all failed items error:', error);
         showAlert('Retry all failed: ' + error.message, 'danger');
@@ -2944,16 +2871,8 @@ function clearActiveAutoBatchJob() {
 }
 
 async function resumeAutoBatchProgressOnLoad() {
-    const savedJobId = getSavedActiveAutoBatchJob();
-    if (!savedJobId || currentAutoBatchJobId) return;
-
-    currentAutoBatchJobId = savedJobId;
-    setAutoBatchRunning(true);
-    await pollAutoBatchProgress(savedJobId);
-
-    if (currentAutoBatchJobId === savedJobId && !autoBatchPollTimer) {
-        autoBatchPollTimer = setInterval(() => pollAutoBatchProgress(savedJobId), 1000);
-    }
+    currentAutoBatchJobId = getSavedActiveAutoBatchJob();
+    await loadJobQueue(); // Observe only. Interrupted jobs never resume automatically.
 }
 
 function calculateAutoBatchEta(job, processed, remaining) {
@@ -2981,7 +2900,7 @@ function updateAutoBatchProgress(job) {
 
     panel.style.display = 'block';
     document.getElementById('autoBatchProgressStatus').textContent = job.message || 'Running automatic poster batch...';
-    document.getElementById('autoBatchCurrentItem').textContent = job.current_item ? `Current item: ${job.current_item}` : 'No item currently processing';
+    document.getElementById('autoBatchCurrentItem').textContent = (job.current_item ? `Current item: ${job.current_item}` : 'No item currently processing') + ` · ${job.completed_targets || 0} targets finished`;
     document.getElementById('autoBatchProgressCounts').textContent = `${processed} / ${total}`;
     if (progressWrap) progressWrap.style.display = canShowEstimate ? '' : 'none';
     if (etaWrap) etaWrap.style.display = canShowEstimate ? '' : 'none';
@@ -3003,46 +2922,8 @@ function stopAutoBatchPolling() {
 }
 
 async function pollAutoBatchProgress(jobId) {
-    try {
-        const response = await fetch(`/batch-auto-poster/progress/${jobId}`);
-        const data = await response.json();
-        if (!response.ok || !data.success) throw new Error(data.error || 'Failed to load batch progress');
-
-        const job = data.job;
-        if (!autoBatchStartedAt && job.created_at) {
-            const createdAt = Date.parse(job.created_at);
-            if (!Number.isNaN(createdAt)) autoBatchStartedAt = createdAt;
-        }
-        updateAutoBatchProgress(job);
-        applyAutoBatchResultMarkers(job.results || [], job.updated_at);
-
-        if (job.done) {
-            stopAutoBatchPolling();
-            setAutoBatchRunning(false);
-            currentAutoBatchJobId = null;
-            autoBatchStartedAt = null;
-            clearActiveAutoBatchJob();
-            latestAutoBatchJob = job;
-            updateLastResultsButton();
-            loadFailedItems({ autoExpand: true });
-            loadProcessedItems();
-
-            if (job.results && job.results.length > 0) {
-                showBatchResults(job.results);
-            }
-            if (!job.success && job.error) {
-                showAlert(job.error, 'danger');
-            }
-        }
-    } catch (error) {
-        stopAutoBatchPolling();
-        setAutoBatchRunning(false);
-        currentAutoBatchJobId = null;
-        autoBatchStartedAt = null;
-        clearActiveAutoBatchJob();
-        console.error('Auto-batch progress error:', error);
-        showAlert('Failed to update auto-batch progress: ' + error.message, 'danger');
-    }
+    currentAutoBatchJobId = jobId;
+    await loadJobQueue();
 }
 
 async function cancelAutoBatch() {
@@ -3137,28 +3018,11 @@ async function startAutoBatchPoster(filter) {
             new_poster_url: null
         });
 
-        const resp = await fetch('/batch-auto-poster/start', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-                filter,
-                library_id: libraryId,
-                item_ids: queuedItemIds,
-                skip_processed: skipProcessed,
-                include_season_posters: includeSeasonPosters,
-                replace_existing_season_posters: replaceSeasonPosters
-            })
+        await enqueuePosterJob({
+            kind: 'auto', filter, library_id: libraryId, item_ids: queuedItemIds,
+            skip_processed: skipProcessed, include_season_posters: includeSeasonPosters,
+            replace_existing_season_posters: replaceSeasonPosters
         });
-
-        const data = await resp.json();
-        if (!resp.ok || !data.success) throw new Error(data.error || 'Automatic batch failed');
-
-        currentAutoBatchJobId = data.job_id;
-        saveActiveAutoBatchJob(data.job_id);
-        await pollAutoBatchProgress(data.job_id);
-        if (currentAutoBatchJobId === data.job_id && !autoBatchPollTimer) {
-            autoBatchPollTimer = setInterval(() => pollAutoBatchProgress(data.job_id), 1000);
-        }
 
     } catch (err) {
         console.error('Auto-batch error:', err);
